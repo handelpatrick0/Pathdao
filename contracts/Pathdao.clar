@@ -900,3 +900,402 @@
     )
   )
 )
+
+;; Cargo Insurance & Escrow System
+;; Provides financial protection for valuable cargo with automated escrow and claims processing
+
+;; Insurance constants
+(define-constant err-invalid-cargo-value (err u113))
+(define-constant err-policy-not-found (err u114))
+(define-constant err-insufficient-escrow (err u115))
+(define-constant err-claim-already-filed (err u116))
+(define-constant err-policy-expired (err u117))
+(define-constant err-unauthorized-claim (err u118))
+(define-constant err-invalid-risk-level (err u119))
+
+;; Insurance status constants
+(define-constant policy-active u1)
+(define-constant policy-claimed u2)
+(define-constant policy-expired u3)
+(define-constant policy-cancelled u4)
+
+;; Risk level constants
+(define-constant risk-low u1)
+(define-constant risk-medium u2)
+(define-constant risk-high u3)
+(define-constant risk-extreme u4)
+
+;; Insurance data variables
+(define-data-var next-policy-id uint u1)
+(define-data-var insurance-pool uint u0)
+(define-data-var base-premium-rate uint u200) ;; 2% in basis points
+(define-data-var max-coverage-amount uint u100000000000) ;; 100,000 STX in microSTX
+(define-data-var claim-processing-fee uint u100000) ;; 0.1 STX in microSTX
+
+;; Insurance policy map
+(define-map insurance-policies
+  { policy-id: uint }
+  {
+    route-id: uint,
+    policyholder: principal,
+    cargo-value: uint,
+    coverage-amount: uint,
+    premium-paid: uint,
+    risk-level: uint,
+    policy-status: uint,
+    escrow-amount: uint,
+    created-at: uint,
+    expires-at: uint
+  }
+)
+
+;; Claims map
+(define-map insurance-claims
+  { claim-id: uint }
+  {
+    policy-id: uint,
+    claimant: principal,
+    claim-amount: uint,
+    claim-reason: (string-ascii 200),
+    evidence-hash: (string-ascii 64),
+    claim-status: uint,
+    filed-at: uint,
+    processed-at: (optional uint),
+    payout-amount: uint
+  }
+)
+
+;; Route escrow map
+(define-map route-escrow
+  { route-id: uint }
+  {
+    escrow-holder: principal,
+    total-amount: uint,
+    insurance-amount: uint,
+    delivery-amount: uint,
+    released: bool,
+    release-conditions-met: bool
+  }
+)
+
+;; Risk assessment map
+(define-map risk-factors
+  { factor-id: uint }
+  {
+    factor-name: (string-ascii 50),
+    weight: uint,
+    base-multiplier: uint,
+    is-active: bool
+  }
+)
+
+;; Create insurance policy for a route
+(define-public (create-insurance-policy
+  (route-id uint)
+  (cargo-value uint)
+  (coverage-percentage uint))
+  (let
+    (
+      (policy-id (var-get next-policy-id))
+      (route (unwrap! (map-get? routes { route-id: route-id }) err-not-found))
+      (coverage-amount (/ (* cargo-value coverage-percentage) u100))
+      (risk-level (assess-route-risk route-id))
+      (premium (calculate-insurance-premium cargo-value risk-level coverage-percentage))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block u1440)) ;; Expires in ~10 days
+    )
+    ;; Validate inputs
+    (asserts! (is-eq tx-sender (get creator route)) err-unauthorized)
+    (asserts! (> cargo-value u0) err-invalid-cargo-value)
+    (asserts! (and (>= coverage-percentage u10) (<= coverage-percentage u100)) err-invalid-bid)
+    (asserts! (<= coverage-amount (var-get max-coverage-amount)) err-invalid-cargo-value)
+    (asserts! (is-eq (get status route) status-open) err-route-closed)
+    
+    ;; Transfer premium to insurance pool
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool (+ (var-get insurance-pool) premium))
+    
+    ;; Create policy
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      {
+        route-id: route-id,
+        policyholder: tx-sender,
+        cargo-value: cargo-value,
+        coverage-amount: coverage-amount,
+        premium-paid: premium,
+        risk-level: risk-level,
+        policy-status: policy-active,
+        escrow-amount: u0,
+        created-at: current-block,
+        expires-at: expiry-block
+      }
+    )
+    
+    (var-set next-policy-id (+ policy-id u1))
+    (ok policy-id)
+  )
+)
+
+;; Create escrow for insured route
+(define-public (create-route-escrow
+  (route-id uint)
+  (delivery-payment uint))
+  (let
+    (
+      (route (unwrap! (map-get? routes { route-id: route-id }) err-not-found))
+      (policy (get-policy-by-route route-id))
+      (insurance-amount (match policy p (get coverage-amount p) u0))
+      (total-escrow (+ delivery-payment insurance-amount))
+    )
+    ;; Validate route creator is calling
+    (asserts! (is-eq tx-sender (get creator route)) err-unauthorized)
+    (asserts! (> delivery-payment u0) err-invalid-bid)
+    (asserts! (is-none (map-get? route-escrow { route-id: route-id })) err-already-exists)
+    
+    ;; Transfer funds to escrow
+    (try! (stx-transfer? total-escrow tx-sender (as-contract tx-sender)))
+    
+    ;; Create escrow record
+    (map-set route-escrow
+      { route-id: route-id }
+      {
+        escrow-holder: tx-sender,
+        total-amount: total-escrow,
+        insurance-amount: insurance-amount,
+        delivery-amount: delivery-payment,
+        released: false,
+        release-conditions-met: false
+      }
+    )
+    
+    ;; Update policy with escrow amount
+    (match policy
+      p (map-set insurance-policies
+        { policy-id: (get-policy-id-by-route route-id) }
+        (merge p { escrow-amount: insurance-amount }))
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+;; File insurance claim
+(define-public (file-insurance-claim
+  (policy-id uint)
+  (claim-amount uint)
+  (claim-reason (string-ascii 200))
+  (evidence-hash (string-ascii 64)))
+  (let
+    (
+      (policy (unwrap! (map-get? insurance-policies { policy-id: policy-id }) err-policy-not-found))
+      (claim-id policy-id) ;; Simple mapping for this implementation
+      (current-block stacks-block-height)
+    )
+    ;; Validate claim
+    (asserts! (is-eq tx-sender (get policyholder policy)) err-unauthorized-claim)
+    (asserts! (is-eq (get policy-status policy) policy-active) err-policy-expired)
+    (asserts! (< current-block (get expires-at policy)) err-policy-expired)
+    (asserts! (<= claim-amount (get coverage-amount policy)) err-invalid-cargo-value)
+    (asserts! (is-none (map-get? insurance-claims { claim-id: claim-id })) err-claim-already-filed)
+    
+    ;; Pay claim processing fee
+    (try! (stx-transfer? (var-get claim-processing-fee) tx-sender (as-contract tx-sender)))
+    
+    ;; Create claim record
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      {
+        policy-id: policy-id,
+        claimant: tx-sender,
+        claim-amount: claim-amount,
+        claim-reason: claim-reason,
+        evidence-hash: evidence-hash,
+        claim-status: u1, ;; Pending
+        filed-at: current-block,
+        processed-at: none,
+        payout-amount: u0
+      }
+    )
+    
+    ;; Update policy status
+    (map-set insurance-policies
+      { policy-id: policy-id }
+      (merge policy { policy-status: policy-claimed })
+    )
+    
+    (ok claim-id)
+  )
+)
+
+;; Process insurance claim (admin function)
+(define-public (process-insurance-claim
+  (claim-id uint)
+  (approved bool)
+  (payout-percentage uint))
+  (let
+    (
+      (claim (unwrap! (map-get? insurance-claims { claim-id: claim-id }) err-not-found))
+      (policy (unwrap! (map-get? insurance-policies { policy-id: (get policy-id claim) }) err-policy-not-found))
+      (payout-amount (if approved (/ (* (get claim-amount claim) payout-percentage) u100) u0))
+      (current-block stacks-block-height)
+    )
+    ;; Only contract owner can process claims
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get claim-status claim) u1) err-invalid-status) ;; Must be pending
+    (asserts! (<= payout-percentage u100) err-invalid-bid)
+    
+    ;; Update claim record
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      (merge claim {
+        claim-status: (if approved u2 u3), ;; Approved or denied
+        processed-at: (some current-block),
+        payout-amount: payout-amount
+      })
+    )
+    
+    ;; Process payout if approved
+    (if (and approved (> payout-amount u0))
+      (begin
+        (try! (as-contract (stx-transfer? payout-amount tx-sender (get claimant claim))))
+        (var-set insurance-pool (- (var-get insurance-pool) payout-amount))
+      )
+      true
+    )
+    
+    (ok approved)
+  )
+)
+
+;; Release escrow upon successful delivery
+(define-public (release-escrow (route-id uint))
+  (let
+    (
+      (route (unwrap! (map-get? routes { route-id: route-id }) err-not-found))
+      (escrow (unwrap! (map-get? route-escrow { route-id: route-id }) err-not-found))
+      (assigned-courier (unwrap! (get assigned-courier route) err-unauthorized))
+    )
+    ;; Validate delivery completion
+    (asserts! (is-eq (get status route) status-completed) err-invalid-status)
+    (asserts! (not (get released escrow)) err-invalid-status)
+    (asserts! (or (is-eq tx-sender (get escrow-holder escrow)) (is-eq tx-sender contract-owner)) err-unauthorized)
+    
+    ;; Release delivery payment to courier
+    (try! (as-contract (stx-transfer? (get delivery-amount escrow) tx-sender assigned-courier)))
+    
+    ;; Return insurance amount to policy holder if no claims
+    (let ((policy (get-policy-by-route route-id)))
+      (match policy
+        p (if (is-eq (get policy-status p) policy-active)
+          (try! (as-contract (stx-transfer? (get insurance-amount escrow) tx-sender (get policyholder p))))
+          true)
+        true
+      )
+    )
+    
+    ;; Mark escrow as released
+    (map-set route-escrow
+      { route-id: route-id }
+      (merge escrow { released: true, release-conditions-met: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions
+
+;; Get insurance policy
+(define-read-only (get-insurance-policy (policy-id uint))
+  (map-get? insurance-policies { policy-id: policy-id })
+)
+
+;; Get insurance claim
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id })
+)
+
+;; Get route escrow
+(define-read-only (get-route-escrow-info (route-id uint))
+  (map-get? route-escrow { route-id: route-id })
+)
+
+;; Get insurance pool balance
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool)
+)
+
+;; Calculate insurance premium
+(define-read-only (calculate-insurance-premium (cargo-value uint) (risk-level uint) (coverage-percentage uint))
+  (let
+    (
+      (base-rate (var-get base-premium-rate))
+      (risk-multiplier (get-risk-multiplier risk-level))
+      (coverage-amount (/ (* cargo-value coverage-percentage) u100))
+    )
+    (/ (* coverage-amount base-rate risk-multiplier) u1000000) ;; Normalize to microSTX
+  )
+)
+
+;; Private helper functions
+
+;; Assess route risk level
+(define-private (assess-route-risk (route-id uint))
+  (let
+    (
+      (route (unwrap! (map-get? routes { route-id: route-id }) risk-low))
+      (distance (get distance route))
+      (deadline-urgency (- (get deadline route) stacks-block-height))
+    )
+    ;; Simple risk assessment based on distance and urgency
+    (if (> distance u1000)
+      (if (< deadline-urgency u72) risk-extreme risk-high) ;; Long distance, urgent
+      (if (< deadline-urgency u144) risk-medium risk-low) ;; Short distance or normal timeline
+    )
+  )
+)
+
+;; Get risk multiplier for premium calculation
+(define-private (get-risk-multiplier (risk-level uint))
+  (if (is-eq risk-level risk-low)
+    u100
+    (if (is-eq risk-level risk-medium)
+      u150
+      (if (is-eq risk-level risk-high)
+        u200
+        u300 ;; extreme risk
+      )
+    )
+  )
+)
+
+;; Get policy by route ID
+(define-private (get-policy-by-route (route-id uint))
+  (let
+    (
+      (potential-policies (list u1 u2 u3 u4 u5))
+    )
+    (fold find-policy-by-route potential-policies none)
+  )
+)
+
+;; Helper to find policy by route
+(define-private (find-policy-by-route 
+  (policy-id uint)
+  (acc (optional { route-id: uint, policyholder: principal, cargo-value: uint, coverage-amount: uint, premium-paid: uint, risk-level: uint, policy-status: uint, escrow-amount: uint, created-at: uint, expires-at: uint })))
+  (if (is-some acc)
+    acc
+    (match (map-get? insurance-policies { policy-id: policy-id })
+      policy (some policy)
+      none
+    )
+  )
+)
+
+;; Get policy ID by route (simplified)
+(define-private (get-policy-id-by-route (route-id uint))
+  u1 ;; Simplified for this implementation
+)
+
